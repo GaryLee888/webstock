@@ -12,7 +12,7 @@ import time
 from FinMind.data import DataLoader
 
 # --- 設定頁面與中文字型 ---
-st.set_page_config(layout="wide", page_title="Gary's 決策系統 V60.10 (FinMind版)")
+st.set_page_config(layout="wide", page_title="Gary's 決策系統 V60.10 (FinMind原生版)")
 
 plt.rcParams['axes.unicode_minus'] = False
 font_path = None
@@ -39,69 +39,47 @@ COLORS = {
 
 # --- 核心工具函式 ---
 
-def get_session():
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    })
-    return session
-
-@st.cache_data(ttl=3600)
-def load_all_tw_stocks():
-    """下載股票清單用於搜尋建議"""
-    tw_stock_map = {}
-    session = get_session()
+@st.cache_data(ttl=86400) # 快取一天，因為股票清單不常變
+def load_stock_map_from_finmind():
+    """直接從 FinMind 下載全台股清單，保證不被擋"""
+    stock_map = {}
     try:
-        sources = [(2, '上市'), (4, '上櫃'), (5, '興櫃')]
-        for mode, suffix in sources:
-            url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
-            try:
-                res = session.get(url, timeout=5)
-                res.encoding = 'big5'
-                dfs = pd.read_html(io.StringIO(res.text))
-                if dfs and len(dfs) > 0:
-                    df = dfs[0]
-                    if df.shape[1] > 1:
-                        for _, row in df.iloc[2:].iterrows():
-                            try:
-                                code_name = row[0]
-                                if not isinstance(code_name, str): continue
-                                parts = code_name.split()
-                                if len(parts) >= 2:
-                                    code = parts[0].strip()
-                                    name = parts[1].strip()
-                                    if code.isdigit() and len(code) == 4:
-                                        # FinMind 不需要後綴，直接存代號
-                                        tw_stock_map[code] = code 
-                                        tw_stock_map[name] = code
-                            except: continue
-                time.sleep(0.5)
-            except: pass
-        return tw_stock_map
-    except:
+        dl = DataLoader()
+        # 下載台股總表
+        df = dl.taiwan_stock_info()
+        
+        if df is not None and not df.empty:
+            for _, row in df.iterrows():
+                code = row['stock_id']
+                name = row['stock_name']
+                # 建立雙向對照表
+                stock_map[code] = code       # 輸入 3033 -> 3033
+                stock_map[name] = code       # 輸入 威健 -> 3033
+                # 處理可能的別名 (例如有些輸入會帶 .TW)
+                stock_map[f"{code}.TW"] = code
+                stock_map[f"{code}.TWO"] = code
+                
+        return stock_map
+    except Exception as e:
+        print(f"FinMind 清單下載失敗: {e}")
         return {}
 
 def download_from_finmind(stock_id):
-    """
-    使用 FinMind 下載資料，並轉換格式以符合原本的程式邏輯
-    """
+    """使用 FinMind 下載資料"""
     try:
-        # 1. 清理代號 (移除 .TW 或 .TWO，FinMind 只要純數字)
-        clean_id = stock_id.split('.')[0]
+        # 確保代號乾淨
+        clean_id = stock_id.strip()
         
-        # 2. 設定日期範圍 (抓過去 400 天，確保有足夠數據做 MA60)
+        # 設定日期範圍 (抓過去 400 天)
         start_date = (datetime.now() - timedelta(days=400)).strftime('%Y-%m-%d')
         
-        # 3. 呼叫 FinMind
         dl = DataLoader()
-        # 下載日K
         df = dl.taiwan_stock_daily(stock_id=clean_id, start_date=start_date)
         
         if df.empty:
             return pd.DataFrame()
 
-        # 4. 資料清洗與重新命名 (對齊 Yahoo Finance 格式)
-        # FinMind 欄位: date, stock_id, Trading_Volume, Trading_money, open, max, min, close, spread, Trading_turnover
+        # 資料清洗 (對齊格式)
         df = df.rename(columns={
             'date': 'Date',
             'open': 'Open',
@@ -111,46 +89,28 @@ def download_from_finmind(stock_id):
             'Trading_Volume': 'Volume'
         })
         
-        # 設定索引為日期
         df['Date'] = pd.to_datetime(df['Date'])
         df = df.set_index('Date')
         
-        # 確保數值型態正確
         cols = ['Open', 'High', 'Low', 'Close', 'Volume']
         for c in cols:
             df[c] = pd.to_numeric(df[c], errors='coerce')
             
-        # 排序
         df = df.sort_index()
-        
         return df
 
     except Exception as e:
         st.error(f"FinMind 下載錯誤: {e}")
         return pd.DataFrame()
 
-def resolve_symbol(query, tw_stock_map):
+def resolve_symbol(query, stock_map):
     query = query.strip().upper()
     
-    # 1. 優先查快取
-    if query in tw_stock_map: 
-        return tw_stock_map[query], query
-    
-    # 2. 備援 API 搜尋
-    try:
-        session = get_session()
-        url = f"https://www.twse.com.tw/rwd/zh/api/codeQuery?query={query}"
-        res = session.get(url, timeout=3).json()
+    # 1. 優先查 FinMind 建立的對照表
+    if query in stock_map: 
+        return stock_map[query], query
         
-        if 'suggestions' in res and res['suggestions']:
-            first_match = res['suggestions'][0]
-            parts = first_match.split('\t')
-            if len(parts) >= 2:
-                return parts[0], parts[1] # 回傳純數字代號
-    except:
-        pass
-
-    # 3. 若輸入純數字，直接回傳
+    # 2. 如果是數字，直接回傳
     if query.isdigit():
         return query, query
 
@@ -260,32 +220,40 @@ def predict_monte_carlo(prices, forecast_days=10, simulations=1000):
 
 # --- 主介面 ---
 
-st.title("Gary's 決策系統 V60.10 - FinMind 資料庫版")
+st.title("Gary's 決策系統 V60.10 - FinMind 原生版")
 
 col_input, col_status = st.columns([3, 1])
+
+stock_map = load_stock_map_from_finmind()
+
 with col_input:
     stock_input = st.text_input("輸入股票代號或名稱 (支援上市櫃/興櫃)", value="2330")
     
-tw_map = load_all_tw_stocks()
 with col_status:
-    if tw_map:
-        st.success(f"系統就緒 ({len(tw_map)} 檔)")
+    if stock_map:
+        st.success(f"資料庫就緒 ({len(stock_map)//2} 檔)")
     else:
-        st.warning("搜尋離線 (仍可直接輸入代號)")
+        st.warning("初始化中...")
 
 if st.button("🔍 智能分析", type="primary"):
     with st.spinner('正在從 FinMind 開放資料庫擷取數據...'):
         try:
-            # 解析代號
-            symbol, name_query = resolve_symbol(stock_input, tw_map)
-            display_name = list(tw_map.keys())[list(tw_map.values()).index(symbol)] if symbol in tw_map.values() else name_query
+            # 解析代號 (現在完全依賴 FinMind 的清單)
+            symbol, name_query = resolve_symbol(stock_input, stock_map)
             
-            # --- 切換至 FinMind 下載 ---
+            # 嘗試反查名稱用於顯示
+            display_name = name_query
+            for name, code in stock_map.items():
+                if code == symbol and name != symbol:
+                    display_name = name
+                    break
+            
+            # 下載資料
             df = download_from_finmind(symbol)
             
             if df.empty:
-                st.error(f"FinMind 資料庫查無 {symbol} 的數據。")
-                st.info("提示：FinMind 資料庫更新時間約為每日收盤後 (15:00~18:00)，若是新掛牌股票可能尚無資料。")
+                st.error(f"找不到 {symbol} ({display_name}) 的數據。")
+                st.info("提示：FinMind 若查無資料，可能是輸入的名稱不完全匹配，請嘗試輸入股票代號 (如 3033)。")
                 st.stop()
             
             data_len = len(df)
@@ -455,4 +423,4 @@ if st.button("🔍 智能分析", type="primary"):
             st.exception(e)
 
 st.markdown("---")
-st.caption("Gary's 決策系統 V60.10 FinMind版 - 僅供技術研究參考，不作為投資建議")
+st.caption("Gary's 決策系統 V60.10 FinMind 原生版 - 僅供技術研究參考，不作為投資建議")

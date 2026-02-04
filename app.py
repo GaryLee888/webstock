@@ -45,17 +45,23 @@ COLORS = {
     "predict_fill": "#d7bde2",
 }
 
-# --- 核心邏輯區 (保留原演算法) ---
+# --- 核心邏輯區 ---
 
-@st.cache_data(ttl=3600)  # 快取股票清單，避免每次重跑
+@st.cache_data(ttl=3600)
 def load_all_tw_stocks():
+    """下載上市櫃興櫃清單，含偽裝 Header 防止被證交所阻擋"""
     tw_stock_map = {}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+    
     try:
+        # 2=上市, 4=上櫃, 5=興櫃
         sources = [(2, '.TW', '上市'), (4, '.TWO', '上櫃'), (5, '.TWO', '興櫃')]
         for mode, suffix, _ in sources:
             url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
             try:
-                res = requests.get(url)
+                res = requests.get(url, headers=headers, timeout=10)
+                res.encoding = 'big5' # 修正亂碼關鍵
+                
                 df = pd.read_html(io.StringIO(res.text))[0]
                 if df.shape[1] > 1:
                     for _, row in df.iloc[2:].iterrows():
@@ -70,7 +76,9 @@ def load_all_tw_stocks():
                                     tw_stock_map[code] = f"{code}{suffix}"
                                     tw_stock_map[name] = f"{code}{suffix}"
                         except: continue
-            except: pass
+            except Exception as e:
+                print(f"模式 {mode} 下載失敗: {e}")
+                pass
         return tw_stock_map
     except:
         return {}
@@ -127,7 +135,6 @@ def calc_indicators(df):
 def calc_zigzag(df):
     n = 3 
     df = df.copy()
-    # 這裡修正一下索引取值的方式，避免 numpy 警告
     highs = df['High'].values
     lows = df['Low'].values
     high_idx = argrelextrema(highs, np.greater_equal, order=n)[0]
@@ -136,7 +143,6 @@ def calc_zigzag(df):
     df['Wave_High'] = np.nan
     df['Wave_Low'] = np.nan
     
-    # 用 iloc 安全寫入
     for idx in high_idx:
         df.iloc[idx, df.columns.get_loc('Wave_High')] = highs[idx]
     for idx in low_idx:
@@ -180,10 +186,28 @@ def predict_monte_carlo(prices, forecast_days=10, simulations=1000):
 
 def resolve_symbol(query, tw_stock_map):
     query = query.strip().upper()
-    if query in tw_stock_map: return tw_stock_map[query], query
+    
+    # 1. 優先查快取
+    if query in tw_stock_map: 
+        return tw_stock_map[query], query
+    
+    # 2. 如果是數字，直接猜測
     if query.isdigit():
-        return f"{query}.TW", query # 預設上市
-    return query, query # 如果直接輸入代號
+        return f"{query}.TW", query 
+        
+    # 3. 備援：用證交所 API 查詢 (處理離線或新股)
+    try:
+        url = f"https://www.twse.com.tw/rwd/zh/api/codeQuery?query={query}"
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3).json()
+        if 'suggestions' in res and res['suggestions']:
+            first_match = res['suggestions'][0]
+            code, name = first_match.split('\t')[:2]
+            # 這裡簡單假設查不到的中文名稱多為上櫃/興櫃，加上 .TWO 試試
+            return f"{code}.TWO", name 
+    except:
+        pass
+
+    return query, query
 
 # --- 主介面 ---
 
@@ -199,19 +223,19 @@ with col_status:
     if tw_map:
         st.success(f"已連線 (資料庫: {len(tw_map)} 檔)")
     else:
-        st.warning("離線模式")
+        st.warning("⚠️ 離線模式 (啟用備援搜尋)")
 
 if st.button("🔍 智能分析", type="primary"):
     with st.spinner('正在分析大數據與計算蒙地卡羅模擬...'):
         try:
             symbol, name_query = resolve_symbol(stock_input, tw_map)
-            # 如果在 map 中找到，名稱用 map 的，否則用輸入的
+            # 顯示名稱邏輯：如果有抓到對應表就用對應表的名稱，否則用查詢的名稱
             display_name = list(tw_map.keys())[list(tw_map.values()).index(symbol)] if symbol in tw_map.values() else name_query
 
             # 下載資料
             df = yf.download(symbol, period="1y", progress=False)
             if df.empty:
-                st.error(f"找不到 {symbol} 的資料。")
+                st.error(f"找不到 {symbol} 的資料 (Yahoo Finance 回傳空值)。")
                 st.stop()
             
             # 處理 MultiIndex (新版 yfinance)
@@ -246,11 +270,10 @@ if st.button("🔍 智能分析", type="primary"):
             smart_sl_val = adjust_to_tick(raw_sl, return_str=False)
             smart_tp_val = adjust_to_tick(raw_tp, return_str=False)
 
-            # 30 指標邏輯 (簡化顯示)
+            # 30 指標邏輯
             prev = df.iloc[-2]
             p_prev = df.iloc[-3] if len(df) > 3 else prev
             
-            # 為了簡潔，這裡直接複製判斷邏輯，實際專案可封裝
             l30 = [
                 ("股價站於月線上", cp > last['MA20']), ("均線呈金叉狀態", last['MA5'] > last['MA20']),
                 ("短期五日線向上", last['MA5'] > prev['MA5']), ("MACD紅柱遞增", last['MACD_D'] > 0 and last['MACD_D'] > prev['MACD_D']),
@@ -327,7 +350,7 @@ if st.button("🔍 智能分析", type="primary"):
                 with st.expander("📊 查看詳細基因與指標", expanded=False):
                     st.write("**飆股基因**")
                     for desc, passed in gene:
-                        icon = "🔴" if passed else "⚫" # 紅色代表多方(台股習慣)
+                        icon = "🔴" if passed else "⚫" 
                         st.write(f"{icon} {desc}")
                     st.write("**30項技術指標**")
                     for desc, passed in l30:
@@ -386,7 +409,6 @@ if st.button("🔍 智能分析", type="primary"):
                     future_dates = pd.bdate_range(start=last_date, periods=11)[1:]
                     date_labels += [d.strftime('%m-%d') for d in future_dates]
                 
-                # 簡化 X 軸顯示密度
                 step = max(1, len(date_labels) // 10)
                 ax.set_xticks(range(0, len(date_labels), step))
                 ax.set_xticklabels(date_labels[::step], rotation=0)

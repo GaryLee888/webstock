@@ -402,7 +402,7 @@ if st.button("🔍 智能分析", type="primary"):
                 ax.axhline(smart_tp_val, color=COLORS["bull"], linestyle=':', alpha=0.6)
                 ax.axhline(smart_sl_val, color=COLORS["bear"], linestyle=':', alpha=0.6)
 
-                ax.set_title(f"{display_name} 技術分析與預測", fontproperties=font_prop if font_path else None)
+                ax.set_title(f"{display_name} 蒙地卡羅機率模擬", fontproperties=font_prop if font_path else None)
                 ax.legend(prop=font_prop if font_path else None)
                 ax.grid(True, linestyle=':', alpha=0.3)
                 
@@ -424,6 +424,7 @@ if st.button("🔍 智能分析", type="primary"):
 
 st.markdown("---")
 st.caption("決策系統 - 僅供技術研究參考，不作為投資建議")
+
 
 
 

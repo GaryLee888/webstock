@@ -423,6 +423,7 @@ if st.button("🔍 智能分析", type="primary"):
             st.exception(e)
 
 st.markdown("---")
-st.caption("Gary's 決策系統 V60.10 FinMind 原生版 - 僅供技術研究參考，不作為投資建議")
+st.caption("決策系統 - 僅供技術研究參考，不作為投資建議")
+
 
 

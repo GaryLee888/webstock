@@ -60,24 +60,27 @@ def load_all_tw_stocks():
             url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
             try:
                 res = requests.get(url, headers=headers, timeout=10)
-                res.encoding = 'big5' # 修正亂碼關鍵
+                res.encoding = 'big5' 
                 
-                df = pd.read_html(io.StringIO(res.text))[0]
-                if df.shape[1] > 1:
-                    for _, row in df.iloc[2:].iterrows():
-                        try:
-                            code_name = row[0]
-                            if not isinstance(code_name, str): continue
-                            parts = code_name.split()
-                            if len(parts) >= 2:
-                                code = parts[0].strip()
-                                name = parts[1].strip()
-                                if code.isdigit() and len(code) == 4:
-                                    tw_stock_map[code] = f"{code}{suffix}"
-                                    tw_stock_map[name] = f"{code}{suffix}"
-                        except: continue
+                # 嘗試解析 HTML
+                dfs = pd.read_html(io.StringIO(res.text))
+                if dfs and len(dfs) > 0:
+                    df = dfs[0]
+                    if df.shape[1] > 1:
+                        # 跳過標頭，通常從第2行開始資料
+                        for _, row in df.iloc[2:].iterrows():
+                            try:
+                                code_name = row[0]
+                                if not isinstance(code_name, str): continue
+                                parts = code_name.split()
+                                if len(parts) >= 2:
+                                    code = parts[0].strip()
+                                    name = parts[1].strip()
+                                    if code.isdigit() and len(code) == 4:
+                                        tw_stock_map[code] = f"{code}{suffix}"
+                                        tw_stock_map[name] = f"{code}{suffix}"
+                            except: continue
             except Exception as e:
-                print(f"模式 {mode} 下載失敗: {e}")
                 pass
         return tw_stock_map
     except:
@@ -200,11 +203,24 @@ def resolve_symbol(query, tw_stock_map):
         url = f"https://www.twse.com.tw/rwd/zh/api/codeQuery?query={query}"
         res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3).json()
         if 'suggestions' in res and res['suggestions']:
+            # 回傳格式範例: "3033\t威健\t上市" 或 "6695\t貝爾威勒\t興櫃"
             first_match = res['suggestions'][0]
-            code, name = first_match.split('\t')[:2]
-            # 這裡簡單假設查不到的中文名稱多為上櫃/興櫃，加上 .TWO 試試
-            return f"{code}.TWO", name 
-    except:
+            parts = first_match.split('\t')
+            
+            if len(parts) >= 2:
+                code = parts[0]
+                name = parts[1]
+                
+                # 判斷市場別 (如果有的話)
+                suffix = ".TW" # 預設上市
+                if len(parts) >= 3:
+                    market_type = parts[2]
+                    if "上櫃" in market_type or "興櫃" in market_type:
+                        suffix = ".TWO"
+                
+                return f"{code}{suffix}", name
+    except Exception as e:
+        print(f"API Search Error: {e}")
         pass
 
     return query, query
@@ -216,7 +232,7 @@ st.title("Gary's 決策系統 V60.10 - 興櫃彈性容錯 Web版")
 # 側邊欄或頂部輸入
 col_input, col_status = st.columns([3, 1])
 with col_input:
-    stock_input = st.text_input("輸入股票代號或名稱 (例如: 2330, 鴻海)", value="貝爾威勒")
+    stock_input = st.text_input("輸入股票代號或名稱 (例如: 2330, 鴻海)", value="威健")
     
 tw_map = load_all_tw_stocks()
 with col_status:
@@ -229,16 +245,17 @@ if st.button("🔍 智能分析", type="primary"):
     with st.spinner('正在分析大數據與計算蒙地卡羅模擬...'):
         try:
             symbol, name_query = resolve_symbol(stock_input, tw_map)
-            # 顯示名稱邏輯：如果有抓到對應表就用對應表的名稱，否則用查詢的名稱
+            # 顯示名稱邏輯
             display_name = list(tw_map.keys())[list(tw_map.values()).index(symbol)] if symbol in tw_map.values() else name_query
 
             # 下載資料
             df = yf.download(symbol, period="1y", progress=False)
             if df.empty:
                 st.error(f"找不到 {symbol} 的資料 (Yahoo Finance 回傳空值)。")
+                st.info("提示：若為興櫃股票，可能因成交量過低導致資料抓取失敗。")
                 st.stop()
             
-            # 處理 MultiIndex (新版 yfinance)
+            # 處理 MultiIndex
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
 

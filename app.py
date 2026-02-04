@@ -12,7 +12,7 @@ import time
 from FinMind.data import DataLoader
 
 # --- 設定頁面與中文字型 ---
-st.set_page_config(layout="wide", page_title="Gary's 決策系統 V60.10 (FinMind原生版)")
+st.set_page_config(layout="wide", page_title="決策系統")
 
 plt.rcParams['axes.unicode_minus'] = False
 font_path = None
@@ -424,3 +424,4 @@ if st.button("🔍 智能分析", type="primary"):
 
 st.markdown("---")
 st.caption("Gary's 決策系統 V60.10 FinMind 原生版 - 僅供技術研究參考，不作為投資建議")
+

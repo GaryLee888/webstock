@@ -220,7 +220,7 @@ def predict_monte_carlo(prices, forecast_days=10, simulations=1000):
 
 # --- 主介面 ---
 
-st.title("Gary's 決策系統 V60.10 - FinMind 原生版")
+st.title("決策系統")
 
 col_input, col_status = st.columns([3, 1])
 
@@ -424,4 +424,5 @@ if st.button("🔍 智能分析", type="primary"):
 
 st.markdown("---")
 st.caption("Gary's 決策系統 V60.10 FinMind 原生版 - 僅供技術研究參考，不作為投資建議")
+
 

@@ -9,15 +9,15 @@ from datetime import timedelta
 import io
 import matplotlib.font_manager as fm
 import os
+import time
+import random
 
 # --- 設定頁面與中文字型 ---
-st.set_page_config(layout="wide", page_title="Gary's 決策系統 V60.10 (Web版)")
+st.set_page_config(layout="wide", page_title="Gary's 決策系統 V60.10 (雲端防禦版)")
 
-# 嘗試設定中文字型 (相容 Windows 開發與 Linux 部署)
+# 嘗試設定中文字型
 plt.rcParams['axes.unicode_minus'] = False
 font_path = None
-
-# 檢查常見的 Linux 中文字型路徑 (Streamlit Cloud 適用)
 possible_fonts = [
     '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc',
     '/usr/share/fonts/truetype/wqy/wqy-microhei.ttc',
@@ -28,30 +28,34 @@ for p in possible_fonts:
         plt.rcParams['font.family'] = font_prop.get_name()
         font_path = p
         break
-
-# 如果找不到 Linux 字型，則嘗試 Windows 字型
 if font_path is None:
     plt.rcParams['font.sans-serif'] = ['Microsoft JhengHei', 'SimHei', 'Arial']
 
 # --- 風格配色 ---
 COLORS = {
-    "bull": "#e74c3c",          # 紅
-    "bear": "#27ae60",          # 綠
-    "neutral": "#7f8c8d", 
-    "wave": "#2980b9", 
-    "predict_optimistic": "#e74c3c", 
-    "predict_median": "#8e44ad",      
-    "predict_pessimistic": "#27ae60",
+    "bull": "#e74c3c", "bear": "#27ae60", "neutral": "#7f8c8d", 
+    "wave": "#2980b9", "predict_optimistic": "#e74c3c", 
+    "predict_median": "#8e44ad", "predict_pessimistic": "#27ae60",
     "predict_fill": "#d7bde2",
 }
 
-# --- 核心邏輯區 ---
+# --- 核心工具函式 ---
+
+def get_session():
+    """建立一個偽裝成瀏覽器的 Session"""
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7'
+    })
+    return session
 
 @st.cache_data(ttl=3600)
 def load_all_tw_stocks():
-    """下載上市櫃興櫃清單，含偽裝 Header 防止被證交所阻擋"""
+    """下載股票清單，失敗時靜默處理，依賴備援搜尋"""
     tw_stock_map = {}
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+    session = get_session()
     
     try:
         # 2=上市, 4=上櫃, 5=興櫃
@@ -59,15 +63,12 @@ def load_all_tw_stocks():
         for mode, suffix, _ in sources:
             url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
             try:
-                res = requests.get(url, headers=headers, timeout=10)
-                res.encoding = 'big5' 
-                
-                # 嘗試解析 HTML
+                res = session.get(url, timeout=5)
+                res.encoding = 'big5'
                 dfs = pd.read_html(io.StringIO(res.text))
                 if dfs and len(dfs) > 0:
                     df = dfs[0]
                     if df.shape[1] > 1:
-                        # 跳過標頭，通常從第2行開始資料
                         for _, row in df.iloc[2:].iterrows():
                             try:
                                 code_name = row[0]
@@ -80,12 +81,81 @@ def load_all_tw_stocks():
                                         tw_stock_map[code] = f"{code}{suffix}"
                                         tw_stock_map[name] = f"{code}{suffix}"
                             except: continue
-            except Exception as e:
-                pass
+                time.sleep(1) # 禮貌性延遲
+            except: pass
         return tw_stock_map
     except:
         return {}
 
+def robust_download(symbol):
+    """強化的下載函式，包含重試機制與偽裝"""
+    max_retries = 3
+    wait_seconds = 2
+    
+    for attempt in range(max_retries):
+        try:
+            # 使用自定義 Session 進行下載
+            session = get_session()
+            # yfinance 允許傳入 session (新版功能)
+            # 如果這行報錯，代表 yfinance 版本較舊，會自動退回到普通下載
+            df = yf.download(symbol, period="1y", progress=False, session=session)
+            
+            if not df.empty:
+                return df
+            
+            # 如果是空資料，可能是連線被擋，等待後重試
+            time.sleep(wait_seconds + random.random())
+            
+        except Exception as e:
+            # 遇到 Rate Limit (Too Many Requests) 時特別處理
+            if "Too Many Requests" in str(e) or "429" in str(e):
+                st.toast(f"⚠️ 偵測到流量限制，正在切換線路重試 ({attempt+1}/{max_retries})...")
+                time.sleep(wait_seconds * (attempt + 1)) # 指數退避
+            else:
+                pass
+    
+    return pd.DataFrame() # 最終還是失敗則回傳空
+
+def resolve_symbol(query, tw_stock_map):
+    query = query.strip().upper()
+    
+    # 1. 優先查快取
+    if query in tw_stock_map: 
+        return tw_stock_map[query], query
+    
+    # 2. 備援：用證交所 API 查詢
+    try:
+        session = get_session()
+        url = f"https://www.twse.com.tw/rwd/zh/api/codeQuery?query={query}"
+        res = session.get(url, timeout=5).json()
+        
+        if 'suggestions' in res and res['suggestions']:
+            first_match = res['suggestions'][0]
+            parts = first_match.split('\t')
+            
+            if len(parts) >= 2:
+                code = parts[0]
+                name = parts[1]
+                
+                # 3. 嚴謹判斷市場別 (解決威健變.TWO的問題)
+                suffix = ".TW" # 預設上市
+                if len(parts) >= 3:
+                    market_type = parts[2]
+                    # 上櫃、興櫃、興櫃一般板 都歸類為 .TWO
+                    if "上櫃" in market_type or "興櫃" in market_type:
+                        suffix = ".TWO"
+                
+                return f"{code}{suffix}", name
+    except:
+        pass
+
+    # 4. 最後手段：如果是4位數字，預設上市
+    if query.isdigit() and len(query) == 4:
+        return f"{query}.TW", query
+
+    return query, query
+
+# --- 指標計算 (保持原樣) ---
 def adjust_to_tick(price, return_str=True):
     price = float(price)
     if price < 10: val = round(price, 2); fmt = "{:.2f}"
@@ -187,72 +257,43 @@ def predict_monte_carlo(prices, forecast_days=10, simulations=1000):
     except:
         return None, None, None
 
-def resolve_symbol(query, tw_stock_map):
-    query = query.strip().upper()
-    
-    # 1. 優先查快取
-    if query in tw_stock_map: 
-        return tw_stock_map[query], query
-    
-    # 2. 如果是數字，直接猜測
-    if query.isdigit():
-        return f"{query}.TW", query 
-        
-    # 3. 備援：用證交所 API 查詢 (處理離線或新股)
-    try:
-        url = f"https://www.twse.com.tw/rwd/zh/api/codeQuery?query={query}"
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=3).json()
-        if 'suggestions' in res and res['suggestions']:
-            # 回傳格式範例: "3033\t威健\t上市" 或 "6695\t貝爾威勒\t興櫃"
-            first_match = res['suggestions'][0]
-            parts = first_match.split('\t')
-            
-            if len(parts) >= 2:
-                code = parts[0]
-                name = parts[1]
-                
-                # 判斷市場別 (如果有的話)
-                suffix = ".TW" # 預設上市
-                if len(parts) >= 3:
-                    market_type = parts[2]
-                    if "上櫃" in market_type or "興櫃" in market_type:
-                        suffix = ".TWO"
-                
-                return f"{code}{suffix}", name
-    except Exception as e:
-        print(f"API Search Error: {e}")
-        pass
-
-    return query, query
-
 # --- 主介面 ---
 
-st.title("Gary's 決策系統 V60.10 - 興櫃彈性容錯 Web版")
+st.title("Gary's 決策系統 V60.10 - 雲端防禦版")
 
-# 側邊欄或頂部輸入
 col_input, col_status = st.columns([3, 1])
 with col_input:
-    stock_input = st.text_input("輸入股票代號或名稱 (例如: 2330, 鴻海)", value="威健")
+    # 預設改成 威健 方便你測試
+    stock_input = st.text_input("輸入股票代號或名稱", value="威健")
     
 tw_map = load_all_tw_stocks()
 with col_status:
     if tw_map:
-        st.success(f"已連線 (資料庫: {len(tw_map)} 檔)")
+        st.success(f"已連線 ({len(tw_map)} 檔)")
     else:
-        st.warning("⚠️ 離線模式 (啟用備援搜尋)")
+        st.warning("離線模式 (啟用備援搜尋)")
 
 if st.button("🔍 智能分析", type="primary"):
-    with st.spinner('正在分析大數據與計算蒙地卡羅模擬...'):
+    with st.spinner('連線中...'):
         try:
             symbol, name_query = resolve_symbol(stock_input, tw_map)
-            # 顯示名稱邏輯
             display_name = list(tw_map.keys())[list(tw_map.values()).index(symbol)] if symbol in tw_map.values() else name_query
 
-            # 下載資料
-            df = yf.download(symbol, period="1y", progress=False)
+            # 使用強化版下載
+            df = robust_download(symbol)
+            
             if df.empty:
-                st.error(f"找不到 {symbol} 的資料 (Yahoo Finance 回傳空值)。")
-                st.info("提示：若為興櫃股票，可能因成交量過低導致資料抓取失敗。")
+                st.error(f"資料下載失敗: {symbol}")
+                st.markdown(f"""
+                **可能原因分析：**
+                1. **IP 封鎖**: 雲端主機目前連線過於頻繁 (Rate Limit)。
+                2. **代號錯誤**: 
+                   - 若是上市股應為 `{symbol.replace('.TWO','.TW')}`
+                   - 若是興櫃股應為 `{symbol.replace('.TW','.TWO')}`
+                3. **剛開盤**: 資料源尚未更新今日數據。
+                
+                **建議操作**: 等待 1 分鐘後再試，或嘗試輸入完整的代號 (如 `3033.TW`)。
+                """)
                 st.stop()
             
             # 處理 MultiIndex
@@ -265,7 +306,7 @@ if st.button("🔍 智能分析", type="primary"):
                 st.error("資料不足 10 筆，無法分析")
                 st.stop()
             elif data_len < 60:
-                st.warning(f"注意：資料僅 {data_len} 筆，已自動關閉預測功能")
+                st.info(f"資料筆數 {data_len} 筆，已自動關閉預測功能")
                 enable_prediction = False
 
             df = calc_indicators(df)
@@ -332,21 +373,17 @@ if st.button("🔍 智能分析", type="primary"):
                 st.markdown(f"### {display_name} ({symbol})")
                 st.markdown(f"**現價**: {adjust_to_tick(cp)} | **ATR**: {atr:.2f}")
                 
-                # 分數卡片
                 score_color = COLORS["bull"] if final_score >= 60 else COLORS["bear"]
                 cmt = "🚀 鑽石飆股" if final_score >= 80 else "🔥 黃金強勢" if final_score >= 65 else "⚖️ 白銀震盪" if final_score >= 50 else "🐻 青銅弱勢"
                 
-                st.markdown(
-                    f"""
-                    <div style="border:1px solid #ddd; padding:10px; border-radius:5px; text-align:center;">
-                        <span style="color:gray;">綜合評分</span><br>
-                        <span style="font-size:40px; font-weight:bold; color:{score_color}">{final_score:.1f}</span><br>
-                        <span style="background-color:{score_color}; color:white; padding:2px 10px; border-radius:3px;">{cmt}</span>
-                    </div>
-                    """, unsafe_allow_html=True
-                )
+                st.markdown(f"""
+                <div style="border:1px solid #ddd; padding:10px; border-radius:5px; text-align:center;">
+                    <span style="color:gray;">綜合評分</span><br>
+                    <span style="font-size:40px; font-weight:bold; color:{score_color}">{final_score:.1f}</span><br>
+                    <span style="background-color:{score_color}; color:white; padding:2px 10px; border-radius:3px;">{cmt}</span>
+                </div>
+                """, unsafe_allow_html=True)
                 
-                # 預測區
                 if enable_prediction and mc_p50 is not None:
                     target_p50 = mc_p50[-1]
                     p_text = "看漲" if target_p50 > cp else "看跌"
@@ -356,14 +393,12 @@ if st.button("🔍 智能分析", type="primary"):
                     區間: {adjust_to_tick(mc_p10[-1])} ~ {adjust_to_tick(mc_p90[-1])}
                     """, unsafe_allow_html=True)
                 
-                # 操盤規劃
                 st.markdown("---")
                 c1, c2, c3 = st.columns(3)
                 c1.metric("建議進場", smart_entry_str)
                 c2.metric("精密停損", smart_sl_str, delta_color="inverse")
                 c3.metric("黃金停利", smart_tp_str)
 
-                # 基因與指標
                 with st.expander("📊 查看詳細基因與指標", expanded=False):
                     st.write("**飆股基因**")
                     for desc, passed in gene:
@@ -375,13 +410,10 @@ if st.button("🔍 智能分析", type="primary"):
                         st.write(f"{icon} {desc}")
 
             with col_chart:
-                # 繪圖
                 fig, ax = plt.subplots(figsize=(10, 6))
-                
                 dates_idx = np.arange(len(plot_df))
                 opens, highs, lows, closes = plot_df['Open'], plot_df['High'], plot_df['Low'], plot_df['Close']
                 
-                # K線
                 for i in dates_idx:
                     color = COLORS["bull"] if closes.iloc[i] >= opens.iloc[i] else COLORS["bear"]
                     ax.plot([i, i], [lows.iloc[i], highs.iloc[i]], color='black', linewidth=1, zorder=1)
@@ -392,12 +424,10 @@ if st.button("🔍 智能分析", type="primary"):
                 ax.plot(dates_idx, plot_df['MA20'].values, color='#f39c12', label='20MA', linewidth=1.5)
                 ax.plot(dates_idx, plot_df['MA60'].values, color='#2980b9', label='60MA', linewidth=1.5)
 
-                # ZigZag
                 if pivots:
                     px, py = zip(*[(p[0], p[1]) for p in pivots])
                     ax.plot(px, py, color=COLORS["wave"], linewidth=2, alpha=0.7, label='波浪')
                 
-                # 預測通道
                 if enable_prediction and mc_p50 is not None:
                     last_idx = dates_idx[-1]
                     future_x = np.arange(last_idx, last_idx + 11)
@@ -411,7 +441,6 @@ if st.button("🔍 智能分析", type="primary"):
                     ax.plot(future_x, y_p10, color=COLORS["predict_pessimistic"], linestyle='--', alpha=0.5)
                     ax.fill_between(future_x, y_p10, y_p90, color=COLORS["predict_fill"], alpha=0.2)
 
-                # 停損停利線
                 ax.axhline(smart_tp_val, color=COLORS["bull"], linestyle=':', alpha=0.6)
                 ax.axhline(smart_sl_val, color=COLORS["bear"], linestyle=':', alpha=0.6)
 
@@ -419,7 +448,6 @@ if st.button("🔍 智能分析", type="primary"):
                 ax.legend(prop=font_prop if font_path else None)
                 ax.grid(True, linestyle=':', alpha=0.3)
                 
-                # 調整 X 軸日期標籤
                 date_labels = [d.strftime('%m-%d') for d in plot_df.index]
                 if enable_prediction:
                     last_date = plot_df.index[-1]
@@ -436,6 +464,5 @@ if st.button("🔍 智能分析", type="primary"):
             st.error(f"分析發生錯誤: {str(e)}")
             st.exception(e)
 
-# 頁腳
 st.markdown("---")
-st.caption("Gary's 決策系統 V60.10 Web版 - 僅供技術研究參考，不作為投資建議")
+st.caption("Gary's 決策系統 V60.10 雲端防禦版 - 僅供技術研究參考，不作為投資建議")

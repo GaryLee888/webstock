@@ -1,21 +1,19 @@
 import streamlit as st
 import pandas as pd
-import yfinance as yf
 import requests
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import argrelextrema
-from datetime import timedelta
+from datetime import datetime, timedelta
 import io
 import matplotlib.font_manager as fm
 import os
 import time
-import random
+from FinMind.data import DataLoader
 
 # --- 設定頁面與中文字型 ---
-st.set_page_config(layout="wide", page_title="Gary's 決策系統 V60.10 (雲端防禦版)")
+st.set_page_config(layout="wide", page_title="Gary's 決策系統 V60.10 (FinMind版)")
 
-# 嘗試設定中文字型
 plt.rcParams['axes.unicode_minus'] = False
 font_path = None
 possible_fonts = [
@@ -42,25 +40,20 @@ COLORS = {
 # --- 核心工具函式 ---
 
 def get_session():
-    """建立一個偽裝成瀏覽器的 Session"""
     session = requests.Session()
     session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     })
     return session
 
 @st.cache_data(ttl=3600)
 def load_all_tw_stocks():
-    """下載股票清單，失敗時靜默處理，依賴備援搜尋"""
+    """下載股票清單用於搜尋建議"""
     tw_stock_map = {}
     session = get_session()
-    
     try:
-        # 2=上市, 4=上櫃, 5=興櫃
-        sources = [(2, '.TW', '上市'), (4, '.TWO', '上櫃'), (5, '.TWO', '興櫃')]
-        for mode, suffix, _ in sources:
+        sources = [(2, '上市'), (4, '上櫃'), (5, '興櫃')]
+        for mode, suffix in sources:
             url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
             try:
                 res = session.get(url, timeout=5)
@@ -78,43 +71,63 @@ def load_all_tw_stocks():
                                     code = parts[0].strip()
                                     name = parts[1].strip()
                                     if code.isdigit() and len(code) == 4:
-                                        tw_stock_map[code] = f"{code}{suffix}"
-                                        tw_stock_map[name] = f"{code}{suffix}"
+                                        # FinMind 不需要後綴，直接存代號
+                                        tw_stock_map[code] = code 
+                                        tw_stock_map[name] = code
                             except: continue
-                time.sleep(1) # 禮貌性延遲
+                time.sleep(0.5)
             except: pass
         return tw_stock_map
     except:
         return {}
 
-def robust_download(symbol):
-    """強化的下載函式，包含重試機制與偽裝"""
-    max_retries = 3
-    wait_seconds = 2
-    
-    for attempt in range(max_retries):
-        try:
-            # 使用自定義 Session 進行下載
-            session = get_session()
-            # yfinance 允許傳入 session (新版功能)
-            # 如果這行報錯，代表 yfinance 版本較舊，會自動退回到普通下載
-            df = yf.download(symbol, period="1y", progress=False, session=session)
+def download_from_finmind(stock_id):
+    """
+    使用 FinMind 下載資料，並轉換格式以符合原本的程式邏輯
+    """
+    try:
+        # 1. 清理代號 (移除 .TW 或 .TWO，FinMind 只要純數字)
+        clean_id = stock_id.split('.')[0]
+        
+        # 2. 設定日期範圍 (抓過去 400 天，確保有足夠數據做 MA60)
+        start_date = (datetime.now() - timedelta(days=400)).strftime('%Y-%m-%d')
+        
+        # 3. 呼叫 FinMind
+        dl = DataLoader()
+        # 下載日K
+        df = dl.taiwan_stock_daily(stock_id=clean_id, start_date=start_date)
+        
+        if df.empty:
+            return pd.DataFrame()
+
+        # 4. 資料清洗與重新命名 (對齊 Yahoo Finance 格式)
+        # FinMind 欄位: date, stock_id, Trading_Volume, Trading_money, open, max, min, close, spread, Trading_turnover
+        df = df.rename(columns={
+            'date': 'Date',
+            'open': 'Open',
+            'max': 'High',
+            'min': 'Low',
+            'close': 'Close',
+            'Trading_Volume': 'Volume'
+        })
+        
+        # 設定索引為日期
+        df['Date'] = pd.to_datetime(df['Date'])
+        df = df.set_index('Date')
+        
+        # 確保數值型態正確
+        cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+        for c in cols:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
             
-            if not df.empty:
-                return df
-            
-            # 如果是空資料，可能是連線被擋，等待後重試
-            time.sleep(wait_seconds + random.random())
-            
-        except Exception as e:
-            # 遇到 Rate Limit (Too Many Requests) 時特別處理
-            if "Too Many Requests" in str(e) or "429" in str(e):
-                st.toast(f"⚠️ 偵測到流量限制，正在切換線路重試 ({attempt+1}/{max_retries})...")
-                time.sleep(wait_seconds * (attempt + 1)) # 指數退避
-            else:
-                pass
-    
-    return pd.DataFrame() # 最終還是失敗則回傳空
+        # 排序
+        df = df.sort_index()
+        
+        return df
+
+    except Exception as e:
+        st.error(f"FinMind 下載錯誤: {e}")
+        return pd.DataFrame()
 
 def resolve_symbol(query, tw_stock_map):
     query = query.strip().upper()
@@ -123,39 +136,27 @@ def resolve_symbol(query, tw_stock_map):
     if query in tw_stock_map: 
         return tw_stock_map[query], query
     
-    # 2. 備援：用證交所 API 查詢
+    # 2. 備援 API 搜尋
     try:
         session = get_session()
         url = f"https://www.twse.com.tw/rwd/zh/api/codeQuery?query={query}"
-        res = session.get(url, timeout=5).json()
+        res = session.get(url, timeout=3).json()
         
         if 'suggestions' in res and res['suggestions']:
             first_match = res['suggestions'][0]
             parts = first_match.split('\t')
-            
             if len(parts) >= 2:
-                code = parts[0]
-                name = parts[1]
-                
-                # 3. 嚴謹判斷市場別 (解決威健變.TWO的問題)
-                suffix = ".TW" # 預設上市
-                if len(parts) >= 3:
-                    market_type = parts[2]
-                    # 上櫃、興櫃、興櫃一般板 都歸類為 .TWO
-                    if "上櫃" in market_type or "興櫃" in market_type:
-                        suffix = ".TWO"
-                
-                return f"{code}{suffix}", name
+                return parts[0], parts[1] # 回傳純數字代號
     except:
         pass
 
-    # 4. 最後手段：如果是4位數字，預設上市
-    if query.isdigit() and len(query) == 4:
-        return f"{query}.TW", query
+    # 3. 若輸入純數字，直接回傳
+    if query.isdigit():
+        return query, query
 
     return query, query
 
-# --- 指標計算 (保持原樣) ---
+# --- 技術指標計算 (保持不變) ---
 def adjust_to_tick(price, return_str=True):
     price = float(price)
     if price < 10: val = round(price, 2); fmt = "{:.2f}"
@@ -259,47 +260,34 @@ def predict_monte_carlo(prices, forecast_days=10, simulations=1000):
 
 # --- 主介面 ---
 
-st.title("Gary's 決策系統 V60.10 - 雲端防禦版")
+st.title("Gary's 決策系統 V60.10 - FinMind 資料庫版")
 
 col_input, col_status = st.columns([3, 1])
 with col_input:
-    # 預設改成 威健 方便你測試
-    stock_input = st.text_input("輸入股票代號或名稱", value="威健")
+    stock_input = st.text_input("輸入股票代號或名稱 (支援上市櫃/興櫃)", value="2330")
     
 tw_map = load_all_tw_stocks()
 with col_status:
     if tw_map:
-        st.success(f"已連線 ({len(tw_map)} 檔)")
+        st.success(f"系統就緒 ({len(tw_map)} 檔)")
     else:
-        st.warning("離線模式 (啟用備援搜尋)")
+        st.warning("搜尋離線 (仍可直接輸入代號)")
 
 if st.button("🔍 智能分析", type="primary"):
-    with st.spinner('連線中...'):
+    with st.spinner('正在從 FinMind 開放資料庫擷取數據...'):
         try:
+            # 解析代號
             symbol, name_query = resolve_symbol(stock_input, tw_map)
             display_name = list(tw_map.keys())[list(tw_map.values()).index(symbol)] if symbol in tw_map.values() else name_query
-
-            # 使用強化版下載
-            df = robust_download(symbol)
+            
+            # --- 切換至 FinMind 下載 ---
+            df = download_from_finmind(symbol)
             
             if df.empty:
-                st.error(f"資料下載失敗: {symbol}")
-                st.markdown(f"""
-                **可能原因分析：**
-                1. **IP 封鎖**: 雲端主機目前連線過於頻繁 (Rate Limit)。
-                2. **代號錯誤**: 
-                   - 若是上市股應為 `{symbol.replace('.TWO','.TW')}`
-                   - 若是興櫃股應為 `{symbol.replace('.TW','.TWO')}`
-                3. **剛開盤**: 資料源尚未更新今日數據。
-                
-                **建議操作**: 等待 1 分鐘後再試，或嘗試輸入完整的代號 (如 `3033.TW`)。
-                """)
+                st.error(f"FinMind 資料庫查無 {symbol} 的數據。")
+                st.info("提示：FinMind 資料庫更新時間約為每日收盤後 (15:00~18:00)，若是新掛牌股票可能尚無資料。")
                 st.stop()
             
-            # 處理 MultiIndex
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-
             data_len = len(df)
             enable_prediction = True
             if data_len < 10:
@@ -315,6 +303,7 @@ if st.button("🔍 智能分析", type="primary"):
             
             last = df.iloc[-1].copy()
             cp = float(last['Close'])
+            last_date_str = df.index[-1].strftime('%Y-%m-%d')
 
             # 數值計算
             raw_entry = (last['Open'] + last['High'] + last['Low'] + (last['Close'] * 2)) / 5
@@ -371,6 +360,7 @@ if st.button("🔍 智能分析", type="primary"):
             
             with col_report:
                 st.markdown(f"### {display_name} ({symbol})")
+                st.caption(f"資料日期: {last_date_str} (FinMind)")
                 st.markdown(f"**現價**: {adjust_to_tick(cp)} | **ATR**: {atr:.2f}")
                 
                 score_color = COLORS["bull"] if final_score >= 60 else COLORS["bear"]
@@ -465,4 +455,4 @@ if st.button("🔍 智能分析", type="primary"):
             st.exception(e)
 
 st.markdown("---")
-st.caption("Gary's 決策系統 V60.10 雲端防禦版 - 僅供技術研究參考，不作為投資建議")
+st.caption("Gary's 決策系統 V60.10 FinMind版 - 僅供技術研究參考，不作為投資建議")
